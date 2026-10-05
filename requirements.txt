@@ -6,7 +6,7 @@ psycopg2-binary==2.9.*
 pgvector==0.4.*
 redis==6.*
 rq==2.*
-anthropic>=0.60
+openai>=1.40
 sentence-transformers==5.*
 pyjwt==2.*
 passlib[bcrypt]==1.7.*

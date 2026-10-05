@@ -14,28 +14,30 @@ def _fake_chunk(i=1):
 
 
 def _fake_response(text="答案"):
-    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))]
+    )
 
 
 @patch("app.services.rag._client")
-def test_generate_answer_calls_claude(mock_client):
-    mock_client.messages.create.return_value = _fake_response("JWT 是……[1]")
+def test_generate_answer_calls_deepseek(mock_client):
+    mock_client.chat.completions.create.return_value = _fake_response("JWT 是……[1]")
     out = rag.generate_answer("什么是JWT", [_fake_chunk()])
     assert "JWT" in out
-    kwargs = mock_client.messages.create.call_args.kwargs
-    assert kwargs["model"] == "claude-sonnet-5"
+    kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "deepseek-flash"
 
 
-def test_generate_answer_empty_chunks_skips_claude():
+def test_generate_answer_empty_chunks_skips_deepseek():
     out = rag.generate_answer("无关问题", [])
     assert "没有找到相关内容" in out
 
 
 @patch("app.services.rag._client")
 def test_generate_answer_degrades_on_rate_limit(mock_client):
-    import anthropic
+    import openai
 
-    mock_client.messages.create.side_effect = anthropic.RateLimitError(
+    mock_client.chat.completions.create.side_effect = openai.RateLimitError(
         message="rate limited",
         response=MagicMock(status_code=429, headers={}),
         body=None,

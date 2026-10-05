@@ -1,6 +1,6 @@
 # 个人知识库 AI 问答服务
 
-基于 RAG（检索增强生成）的个人知识库问答系统。上传 TXT/PDF 文档后，用自然语言提问，系统检索相关文档片段并调用 Claude API 生成带引用编号的回答。
+基于 RAG（检索增强生成）的个人知识库问答系统。上传 TXT/PDF 文档后，用自然语言提问，系统检索相关文档片段并调用 DeepSeek API 生成带引用编号的回答。
 
 **项目定位**：后端求职实战项目，覆盖异步队列、向量检索、缓存、限流、JWT 认证等高频考点，每个模块均有完整的设计权衡可在面试中阐述。
 
@@ -19,7 +19,7 @@
 问答链路：
   问题 → Redis 缓存查询(user_id + question hash) → 未命中 →
   bge 向量化问题 → pgvector Top-K 余弦检索(默认4, 可配) →
-  拼接 Prompt → Claude API (claude-sonnet-5) → 回答 + 引用来源 → 写缓存(TTL 1h) → 落 query_logs
+  拼接 Prompt → DeepSeek API (deepseek-flash) → 回答 + 引用来源 → 写缓存(TTL 1h) → 落 query_logs
 ```
 
 ---
@@ -32,14 +32,14 @@
 | 数据库 | PostgreSQL 16 + pgvector | 元数据与向量同库，减少一个中间件；pgvector 余弦检索满足万级 chunk 的个人知识库场景 |
 | 缓存/队列 | Redis 7 | 同时充当问答缓存、限流计数器、RQ broker，三合一降低依赖数量 |
 | 异步任务 | RQ（Redis Queue） | 比 Celery 轻量，配置仅需 broker URL；任务失败自动重试 3 次，状态可查 |
-| 大模型 API | Claude API — `claude-sonnet-5` | 官方 `anthropic` Python SDK；1M 上下文；`output_config.effort=low` 显式控制延迟 |
-| Embedding | 本地 `BAAI/bge-small-zh-v1.5` | Claude 无 embedding API；本地跑零成本、中文优化、约 130MB；512 维向量 |
+| 大模型 API | DeepSeek — `deepseek-flash` | OpenAI 兼容接口；国内直连稳定、性价比高；通过 `openai` Python SDK 调用 |
+| Embedding | 本地 `BAAI/bge-small-zh-v1.5` | 本地跑零成本、中文优化、约 130MB；512 维向量 |
 | 认证 | PyJWT + passlib[bcrypt] | JWT 无状态、可配过期时间；bcrypt 加盐哈希，防彩虹表 |
 | PDF 解析 | pypdf | 纯 Python、零系统依赖，轻量 |
 | ORM | SQLAlchemy 2.x + pgvector-python | `select()` 语句式 API；pgvector-python 提供向量列类型与余弦距离运算符 |
 | 配置 | pydantic-settings | 读 `.env`，类型校验，敏感信息不入代码 |
 | 容器化 | Docker + docker-compose | 四容器（api/worker/postgres/redis）一键启动，本地与云端环境一致 |
-| 测试 | pytest + httpx TestClient | Claude 调用全部 mock；sentence-transformers 测试使用真实本地模型 |
+| 测试 | pytest + httpx TestClient | DeepSeek 调用全部 mock；sentence-transformers 测试使用真实本地模型 |
 
 ---
 
@@ -51,7 +51,7 @@
 # 1. 复制环境变量模板
 cp .env.example .env
 
-# 2. 编辑 .env，填入真实的 ANTHROPIC_API_KEY
+# 2. 编辑 .env，填入真实的 DEEPSEEK_API_KEY
 #    其余变量（DATABASE_URL、REDIS_URL）在 Docker 内已由 docker-compose.yml 覆盖，无需改动
 vim .env
 
@@ -94,7 +94,7 @@ open http://localhost:8000/docs
 
 **来源**：这是在冒烟测试中发现并修复的跨用户数据泄漏问题。初始设计使用全局缓存维度（不含 user_id），测试时发现用户 A 的问题缓存会被用户 B 命中，返回基于用户 A 文档内容的答案——这是严重的多租户安全问题。修复方案：retrieve_chunks 联表过滤 user_id；缓存 key 加入 user_id 维度。
 
-**局限**：同一问题不同用户各自调用一次 Claude，无法共享缓存，成本略高于全局缓存。
+**局限**：同一问题不同用户各自调用一次 DeepSeek，无法共享缓存，成本略高于全局缓存。
 
 **扩展方向**：可在用户级缓存之上增加全局语义缓存层（embedding 相似度匹配），但需对 answer 做脱敏审计（确保不含用户私有信息），复杂度较高，适合 v2 阶段。
 
@@ -122,7 +122,7 @@ open http://localhost:8000/docs
 
 ### 4. Embedding：本地模型（非 API）
 
-**选择原因**：Claude API 无 embedding 能力；`BAAI/bge-small-zh-v1.5` 中文优化、512 维向量、约 130MB，本地推理零成本、无网络延迟、无速率限制，适合文档处理 worker 批量向量化场景。
+**选择原因**：`BAAI/bge-small-zh-v1.5` 中文优化、512 维向量、约 130MB，本地推理零成本、无网络延迟、无速率限制，适合文档处理 worker 批量向量化场景。
 
 **局限**：Docker 镜像体积增加约 500MB（含 torch）；首次启动需从 HuggingFace 下载模型（已挂载 `hf_cache` volume 缓存）；CPU 推理速度慢于 GPU，大文档批量处理耗时较长。
 
@@ -148,7 +148,7 @@ app/
 ├── services/
 │   ├── embedding.py # bge-small-zh 本地向量化
 │   ├── chunking.py  # 固定长度 + 重叠窗口分块
-│   ├── rag.py       # 检索 + Claude 调用 + 降级处理
+│   ├── rag.py       # 检索 + DeepSeek 调用 + 降级处理
 │   ├── cache.py     # Redis 问答缓存（用户级隔离）
 │   └── rate_limit.py# 固定窗口限流
 └── tasks.py         # RQ 文档处理任务（提取→分块→向量化→写库）
@@ -168,7 +168,7 @@ Dockerfile
 # 预期：29 passed
 ```
 
-测试覆盖：JWT 注册/登录流程、分块边界（短文本/整除）、缓存命中/未命中、限流 429、文档上传状态流转、RAG 端到端（mock Claude）、健康检查降级。
+测试覆盖：JWT 注册/登录流程、分块边界（短文本/整除）、缓存命中/未命中、限流 429、文档上传状态流转、RAG 端到端（mock DeepSeek）、健康检查降级。
 
 ---
 
@@ -177,6 +177,6 @@ Dockerfile
 | 步骤 | 结果 |
 |---|---|
 | 上传文档 | 立即返回 processing，worker 约 2s 后完成向量化，状态变 completed |
-| 首次提问 | claude-sonnet-5 真实调用，回答含 [1] 引用编号，约 4.3s |
+| 首次提问 | deepseek-flash 真实调用，回答含 [1] 引用编号 |
 | 重复提问（同问题） | 缓存命中，0.01s 返回，cached: true |
 | 跨用户隔离验证 | 用户 B 无法命中用户 A 的缓存，检索结果仅含自己的 chunks |

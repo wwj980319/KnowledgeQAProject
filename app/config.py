@@ -6,8 +6,9 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql://kqa:kqa@localhost:5432/kqa"
     redis_url: str = "redis://localhost:6379/0"
-    anthropic_api_key: str = ""
-    claude_model: str = "claude-sonnet-5"
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-flash"
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     jwt_secret: str = "change-me"
     jwt_expire_minutes: int = 60 * 24
