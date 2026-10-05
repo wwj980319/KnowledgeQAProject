@@ -20,6 +20,8 @@ services:
     environment:
       DATABASE_URL: postgresql://kqa:kqa@postgres:5432/kqa
       REDIS_URL: redis://redis:6379/0
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     ports: ["8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
@@ -32,6 +34,8 @@ services:
     environment:
       DATABASE_URL: postgresql://kqa:kqa@postgres:5432/kqa
       REDIS_URL: redis://redis:6379/0
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}
