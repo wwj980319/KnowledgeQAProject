@@ -1,0 +1,89 @@
+# Re-review package: Task 5 fix (app/tasks.py + tests/test_tasks.py current contents)
+
+===== app/tasks.py =====
+import logging
+
+from app.database import SessionLocal
+from app.models import Chunk, Document
+from app.services.chunking import split_text
+from app.services.embedding import embed_texts
+
+logger = logging.getLogger(__name__)
+
+
+def process_document(document_id: int, text: str, filename: str) -> None:
+    db = SessionLocal()
+    doc = db.get(Document, document_id)
+    if doc is None:
+        db.close()
+        return
+    try:
+        if not text.strip():
+            raise ValueError("empty document")
+        pieces = split_text(text)
+        vectors = embed_texts(pieces)
+        for i, (content, vec) in enumerate(zip(pieces, vectors)):
+            db.add(Chunk(document_id=document_id, content=content,
+                         embedding=vec, chunk_index=i))
+        doc.status = "completed"
+        db.commit()
+        logger.info("document processed",
+                    extra={"document_id": document_id, "chunks": len(pieces)})
+    except Exception as e:
+        db.rollback()
+        doc = db.get(Document, document_id)
+        if doc is not None:
+            doc.status = "failed"
+            doc.error_message = str(e)[:1000]
+            db.commit()
+        logger.exception("document processing failed")
+        raise
+    finally:
+        db.close()
+
+===== tests/test_tasks.py =====
+from unittest.mock import patch
+
+from app.models import Chunk, Document, User
+from app.tasks import process_document
+
+
+def _make_doc(db, email="w@t.com", filename="a.txt"):
+    user = User(email=email, password_hash="x")
+    db.add(user)
+    db.flush()
+    doc = Document(user_id=user.id, filename=filename)
+    db.add(doc)
+    db.flush()
+    return doc
+
+
+def _bind_session(db):
+    # 让 task 复用测试事务中的 session；commit 降级为 flush 以便 fixture 回滚
+    original_rollback = db.rollback
+    db.commit = db.flush
+    db.close = lambda: None
+    # Suppress rollback errors in test context (transaction already managed by fixture)
+    db.rollback = lambda: None
+    return patch("app.tasks.SessionLocal", return_value=db)
+
+
+@patch("app.tasks.embed_texts", side_effect=lambda ts: [[0.0] * 512 for _ in ts])
+def test_process_document_completes(mock_emb, db):
+    doc = _make_doc(db)
+    with _bind_session(db):
+        process_document(doc.id, "测试内容。" * 200, "a.txt")
+    assert doc.status == "completed"
+    assert db.query(Chunk).filter_by(document_id=doc.id).count() > 0
+
+
+@patch("app.tasks.embed_texts", side_effect=lambda ts: [[0.0] * 512 for _ in ts])
+def test_process_document_empty_text_fails(mock_emb, db):
+    doc = _make_doc(db, email="w2@t.com", filename="bad.pdf")
+    with _bind_session(db):
+        try:
+            process_document(doc.id, "", "bad.pdf")
+        except ValueError:
+            pass
+    assert doc.status == "failed"
+    assert doc.error_message

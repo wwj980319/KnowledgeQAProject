@@ -1,0 +1,132 @@
+# Review package: Task 6 (no git — full contents)
+# Controller note: implementer hit a stale redis container without host port mapping (created during an earlier port conflict), invented a docker-exec bridge hack (tests/redis_docker_bridge.py + conftest fixture + get_redis fallback). Controller fixed the root cause (force-recreated container, host PING ok), deleted the bridge file, reverted get_redis() and conftest.py to canonical. Full suite 20/20 after cleanup.
+
+===== app/services/cache.py =====
+import hashlib
+import json
+
+import redis
+
+from app.config import settings
+
+_redis: redis.Redis | None = None
+
+
+def get_redis() -> redis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = redis.from_url(settings.redis_url, decode_responses=True)
+    return _redis
+
+
+def cache_key(question: str) -> str:
+    normalized = question.strip().lower()
+    return "qa:cache:" + hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def get_cached_answer(question: str) -> dict | None:
+    raw = get_redis().get(cache_key(question))
+    return json.loads(raw) if raw else None
+
+
+def set_cached_answer(question: str, payload: dict) -> None:
+    get_redis().set(
+        cache_key(question),
+        json.dumps(payload, ensure_ascii=False),
+        ex=settings.cache_ttl_seconds,
+    )
+
+===== app/services/rate_limit.py =====
+import time
+
+from fastapi import HTTPException
+
+from app.config import settings
+from app.services.cache import get_redis
+
+
+def check_rate_limit(user_id: int) -> None:
+    window = int(time.time()) // 60
+    key = f"rl:{user_id}:{window}"
+    r = get_redis()
+    count = r.incr(key)
+    if count == 1:
+        r.expire(key, 60)
+    if count > settings.rate_limit_per_minute:
+        raise HTTPException(429, "Rate limit exceeded, try again later")
+
+===== tests/test_cache.py =====
+import uuid
+
+from app.services.cache import cache_key, get_cached_answer, set_cached_answer
+
+
+def test_cache_key_normalized():
+    assert cache_key(" 什么是JWT ") == cache_key("什么是jwt")
+
+
+def test_cache_roundtrip():
+    q = f"roundtrip-{uuid.uuid4()}"
+    assert get_cached_answer(q) is None
+    set_cached_answer(q, {"answer": "42", "sources": []})
+    assert get_cached_answer(q)["answer"] == "42"
+
+===== tests/test_rate_limit.py =====
+import random
+
+import pytest
+from fastapi import HTTPException
+
+from app.config import settings
+from app.services.rate_limit import check_rate_limit
+
+
+def test_rate_limit_blocks_after_threshold():
+    user_id = random.randint(10**8, 10**9)  # 随机 id 防跨测试污染
+    for _ in range(settings.rate_limit_per_minute):
+        check_rate_limit(user_id)
+    with pytest.raises(HTTPException) as exc:
+        check_rate_limit(user_id)
+    assert exc.value.status_code == 429
+
+===== tests/conftest.py =====
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
+
+from app.database import engine, get_db, init_db
+from app.main import app
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _create_tables():
+    init_db()
+
+
+@pytest.fixture()
+def db():
+    connection = engine.connect()
+    transaction = connection.begin()
+    Session = sessionmaker(bind=connection)
+    session = Session()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture()
+def client(db):
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def auth_headers(client):
+    client.post("/auth/register", json={"email": "me@t.com", "password": "secret1"})
+    token = client.post(
+        "/auth/login", json={"email": "me@t.com", "password": "secret1"}
+    ).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}

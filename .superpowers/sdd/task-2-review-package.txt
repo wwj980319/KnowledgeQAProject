@@ -1,0 +1,199 @@
+# Review package: Task 2 (no git — full contents of created/modified files)
+# Note: requirements.txt diff vs Task 0: implementer appended email-validator (claims pydantic EmailStr requires it)
+
+===== app/auth.py =====
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import User
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer = HTTPBearer(auto_error=False)
+
+
+def hash_password(p: str) -> str:
+    return pwd_context.hash(p)
+
+
+def verify_password(p: str, hashed: str) -> bool:
+    return pwd_context.verify(p, hashed)
+
+
+def create_access_token(user_id: int) -> str:
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(get_db),
+) -> User:
+    if creds is None:
+        raise HTTPException(401, "Missing token")
+    try:
+        payload = jwt.decode(creds.credentials, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid or expired token")
+    user = db.get(User, int(payload["sub"]))
+    if user is None:
+        raise HTTPException(401, "User not found")
+    return user
+
+===== app/schemas.py =====
+from datetime import datetime
+
+from pydantic import BaseModel, EmailStr, Field
+
+
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+
+===== app/routers/__init__.py =====
+
+===== app/routers/auth.py =====
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.auth import create_access_token, hash_password, verify_password
+from app.database import get_db
+from app.models import User
+from app.schemas import LoginIn, RegisterIn, TokenOut, UserOut
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", status_code=201, response_model=UserOut)
+def register(body: RegisterIn, db: Session = Depends(get_db)):
+    if db.scalar(select(User).where(User.email == body.email)):
+        raise HTTPException(409, "Email already registered")
+    user = User(email=body.email, password_hash=hash_password(body.password))
+    db.add(user)
+    db.flush()
+    return user
+
+
+@router.post("/login", response_model=TokenOut)
+def login(body: LoginIn, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == body.email))
+    if user is None or not verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "Invalid credentials")
+    return TokenOut(access_token=create_access_token(user.id))
+
+===== app/main.py =====
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.database import init_db
+from app.routers import auth as auth_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Knowledge QA Service", lifespan=lifespan)
+app.include_router(auth_router.router)
+
+===== tests/test_auth.py =====
+def test_register_and_login(client):
+    r = client.post("/auth/register", json={"email": "u1@t.com", "password": "secret1"})
+    assert r.status_code == 201
+    r2 = client.post("/auth/register", json={"email": "u1@t.com", "password": "secret1"})
+    assert r2.status_code == 409
+    r3 = client.post("/auth/login", json={"email": "u1@t.com", "password": "secret1"})
+    assert r3.status_code == 200
+    assert r3.json()["access_token"]
+    r4 = client.post("/auth/login", json={"email": "u1@t.com", "password": "wrong!"})
+    assert r4.status_code == 401
+
+===== tests/conftest.py =====
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
+
+from app.database import engine, get_db, init_db
+from app.main import app
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _create_tables():
+    init_db()
+
+
+@pytest.fixture()
+def db():
+    connection = engine.connect()
+    transaction = connection.begin()
+    Session = sessionmaker(bind=connection)
+    session = Session()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture()
+def client(db):
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def auth_headers(client):
+    client.post("/auth/register", json={"email": "me@t.com", "password": "secret1"})
+    token = client.post(
+        "/auth/login", json={"email": "me@t.com", "password": "secret1"}
+    ).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+===== requirements.txt =====
+fastapi==0.116.*
+uvicorn[standard]==0.35.*
+email-validator==2.*
+sqlalchemy==2.0.*
+psycopg2-binary==2.9.*
+pgvector==0.4.*
+redis==6.*
+rq==2.*
+anthropic>=0.60
+sentence-transformers==5.*
+pyjwt==2.*
+passlib[bcrypt]==1.7.*
+bcrypt==4.0.1
+pypdf==5.*
+pydantic-settings==2.*
+python-multipart==0.0.*
+pytest==8.*
+httpx==0.28.*

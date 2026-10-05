@@ -1,0 +1,44 @@
+# Review package: Task 3 (no git — full contents of created files)
+
+===== app/services/__init__.py =====
+
+===== app/services/chunking.py =====
+def split_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
+    if not text:
+        return []
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+    step = chunk_size - overlap
+    chunks = []
+    for start in range(0, len(text), step):
+        chunks.append(text[start : start + chunk_size])
+        if start + chunk_size >= len(text):
+            break
+    return chunks
+
+===== tests/test_chunking.py =====
+from app.services.chunking import split_text
+
+
+def test_empty_text():
+    assert split_text("") == []
+
+
+def test_short_text_single_chunk():
+    assert split_text("你好世界", chunk_size=500, overlap=100) == ["你好世界"]
+
+
+def test_overlap_window():
+    text = "a" * 1000
+    chunks = split_text(text, chunk_size=500, overlap=100)
+    assert len(chunks) == 3          # 步长400: [0:500],[400:900],[800:1000]
+    assert chunks[0] == text[0:500]
+    assert chunks[1] == text[400:900]
+    assert chunks[2] == text[800:1000]
+
+
+def test_all_content_covered():
+    text = "".join(str(i % 10) for i in range(1234))
+    chunks = split_text(text, chunk_size=500, overlap=100)
+    reconstructed = chunks[0] + "".join(c[100:] for c in chunks[1:])
+    assert reconstructed == text

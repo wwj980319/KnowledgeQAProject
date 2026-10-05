@@ -1,0 +1,45 @@
+# Review package: Task 4 (no git — full contents of created files)
+
+===== app/services/embedding.py =====
+from sentence_transformers import SentenceTransformer
+
+from app.config import settings
+
+_model: SentenceTransformer | None = None
+
+# bge 系列：检索 query 侧加指令前缀，文档侧不加
+_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
+
+def _get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(settings.embedding_model)
+    return _model
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    return _get_model().encode(texts, normalize_embeddings=True).tolist()
+
+
+def embed_query(text: str) -> list[float]:
+    return embed_texts([_QUERY_INSTRUCTION + text])[0]
+
+===== tests/test_embedding.py =====
+from app.services.embedding import embed_query, embed_texts
+
+
+def test_embed_texts_dimension():
+    vecs = embed_texts(["缓存是什么", "限流算法"])
+    assert len(vecs) == 2
+    assert len(vecs[0]) == 512
+
+
+def test_embed_empty_list():
+    assert embed_texts([]) == []
+
+
+def test_embed_query_dimension():
+    assert len(embed_query("什么是JWT")) == 512

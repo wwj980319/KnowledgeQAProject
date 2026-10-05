@@ -1,0 +1,1191 @@
+# Final whole-project review package: KnowledgeQAProject (no git — full source)
+
+## File inventory
+app/__init__.py
+app/auth.py
+app/config.py
+app/database.py
+app/logging_conf.py
+app/main.py
+app/models.py
+app/queue.py
+app/routers/__init__.py
+app/routers/auth.py
+app/routers/documents.py
+app/routers/health.py
+app/routers/query.py
+app/schemas.py
+app/services/__init__.py
+app/services/cache.py
+app/services/chunking.py
+app/services/embedding.py
+app/services/extraction.py
+app/services/rag.py
+app/services/rate_limit.py
+app/tasks.py
+tests/__init__.py
+tests/conftest.py
+tests/test_auth.py
+tests/test_cache.py
+tests/test_chunking.py
+tests/test_documents.py
+tests/test_embedding.py
+tests/test_health.py
+tests/test_models.py
+tests/test_query_api.py
+tests/test_rag.py
+tests/test_rate_limit.py
+tests/test_tasks.py
+
+
+===== app/__init__.py =====
+
+===== app/auth.py =====
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.models import User
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer = HTTPBearer(auto_error=False)
+
+
+def hash_password(p: str) -> str:
+    return pwd_context.hash(p)
+
+
+def verify_password(p: str, hashed: str) -> bool:
+    return pwd_context.verify(p, hashed)
+
+
+def create_access_token(user_id: int) -> str:
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(get_db),
+) -> User:
+    if creds is None:
+        raise HTTPException(401, "Missing token")
+    try:
+        payload = jwt.decode(creds.credentials, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid or expired token")
+    user = db.get(User, int(payload["sub"]))
+    if user is None:
+        raise HTTPException(401, "User not found")
+    return user
+
+===== app/config.py =====
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: str = "postgresql://kqa:kqa@localhost:5432/kqa"
+    redis_url: str = "redis://localhost:6379/0"
+    anthropic_api_key: str = ""
+    claude_model: str = "claude-sonnet-5"
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    jwt_secret: str = "change-me"
+    jwt_expire_minutes: int = 60 * 24
+    top_k: int = 4
+    cache_ttl_seconds: int = 3600
+    rate_limit_per_minute: int = 10
+    max_file_size_mb: int = 10
+
+
+settings = Settings()
+
+===== app/database.py =====
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+from app.config import settings
+
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def init_db() -> None:
+    with engine.connect() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
+    from app import models  # noqa: F401  确保模型已注册
+    Base.metadata.create_all(engine)
+
+===== app/logging_conf.py =====
+import json
+import logging
+import sys
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for k in ("document_id", "chunks", "user_id", "path", "status", "duration_ms"):
+            if hasattr(record, k):
+                payload[k] = getattr(record, k)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+===== app/main.py =====
+import logging
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+
+from app.database import init_db
+from app.logging_conf import setup_logging
+from app.routers import auth as auth_router
+from app.routers import documents as documents_router
+from app.routers import health as health_router
+from app.routers import query as query_router
+
+logger = logging.getLogger("request")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+    init_db()
+    yield
+
+
+app = FastAPI(title="Knowledge QA Service", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    logger.info(
+        "request",
+        extra={
+            "path": f"{request.method} {request.url.path}",
+            "status": response.status_code,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 1),
+        },
+    )
+    return response
+
+
+app.include_router(auth_router.router)
+app.include_router(documents_router.router)
+app.include_router(query_router.router)
+app.include_router(health_router.router)
+
+===== app/models.py =====
+from datetime import datetime
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    filename: Mapped[str] = mapped_column(String(512))
+    status: Mapped[str] = mapped_column(String(20), default="processing")
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    chunks = relationship("Chunk", cascade="all, delete-orphan", backref="document")
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    content: Mapped[str] = mapped_column(Text)
+    embedding = mapped_column(Vector(512))
+    chunk_index: Mapped[int] = mapped_column(Integer)
+
+
+class QueryLog(Base):
+    __tablename__ = "query_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text)
+    referenced_chunks = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+===== app/queue.py =====
+import redis
+from rq import Queue
+
+from app.config import settings
+
+
+def get_queue() -> Queue:
+    return Queue("documents", connection=redis.from_url(settings.redis_url))
+
+===== app/routers/__init__.py =====
+
+===== app/routers/auth.py =====
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.auth import create_access_token, hash_password, verify_password
+from app.database import get_db
+from app.models import User
+from app.schemas import LoginIn, RegisterIn, TokenOut, UserOut
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", status_code=201, response_model=UserOut)
+def register(body: RegisterIn, db: Session = Depends(get_db)):
+    if db.scalar(select(User).where(User.email == body.email)):
+        raise HTTPException(409, "Email already registered")
+    user = User(email=body.email, password_hash=hash_password(body.password))
+    db.add(user)
+    db.flush()
+    return user
+
+
+@router.post("/login", response_model=TokenOut)
+def login(body: LoginIn, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == body.email))
+    if user is None or not verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "Invalid credentials")
+    return TokenOut(access_token=create_access_token(user.id))
+
+===== app/routers/documents.py =====
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from rq import Retry
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.auth import get_current_user
+from app.config import settings
+from app.database import get_db
+from app.models import Document, User
+from app.queue import get_queue
+from app.schemas import DocumentOut
+from app.services.extraction import ALLOWED_EXTENSIONS, extract_text
+from app.tasks import process_document
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+@router.post("", status_code=201, response_model=DocumentOut)
+async def upload(
+    file: UploadFile,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    suffix = ("." + file.filename.rsplit(".", 1)[-1].lower()) if "." in file.filename else ""
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(415, "Only .txt and .pdf are supported")
+    data = await file.read()
+    if len(data) > settings.max_file_size_mb * 1024 * 1024:
+        raise HTTPException(413, f"File exceeds {settings.max_file_size_mb}MB limit")
+    try:
+        text = extract_text(file.filename, data)
+    except Exception:
+        raise HTTPException(422, "Failed to extract text from file")
+    doc = Document(user_id=user.id, filename=file.filename)
+    db.add(doc)
+    db.flush()
+    get_queue().enqueue(process_document, doc.id, text, file.filename, retry=Retry(max=3))
+    return doc
+
+
+@router.get("", response_model=list[DocumentOut])
+def list_documents(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    stmt = select(Document).where(Document.user_id == user.id).order_by(Document.id.desc())
+    return list(db.scalars(stmt))
+
+
+def _get_owned(doc_id: int, user: User, db: Session) -> Document:
+    doc = db.get(Document, doc_id)
+    if doc is None or doc.user_id != user.id:
+        raise HTTPException(404, "Document not found")
+    return doc
+
+
+@router.get("/{doc_id}", response_model=DocumentOut)
+def get_document(doc_id: int, user: User = Depends(get_current_user),
+                 db: Session = Depends(get_db)):
+    return _get_owned(doc_id, user, db)
+
+
+@router.delete("/{doc_id}", status_code=204)
+def delete_document(doc_id: int, user: User = Depends(get_current_user),
+                    db: Session = Depends(get_db)):
+    db.delete(_get_owned(doc_id, user, db))
+    db.flush()
+
+===== app/routers/health.py =====
+from fastapi import APIRouter
+from sqlalchemy import text
+
+from app.database import engine
+from app.services.cache import get_redis
+
+router = APIRouter(tags=["ops"])
+
+
+@router.get("/health")
+def health():
+    pg_ok = redis_ok = False
+    try:
+        # 不走 get_db 依赖：PG 完全不可达时依赖注入阶段就会抛错，绕过本函数的
+        # try/except 变成 500；直连 engine 才能保证任何故障都落在守卫内返回 degraded
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        pg_ok = True
+    except Exception:
+        pass
+    try:
+        redis_ok = bool(get_redis().ping())
+    except Exception:
+        pass
+    return {
+        "status": "ok" if (pg_ok and redis_ok) else "degraded",
+        "postgres": pg_ok,
+        "redis": redis_ok,
+    }
+
+===== app/routers/query.py =====
+from fastapi import APIRouter, Depends
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.auth import get_current_user
+from app.database import get_db
+from app.models import QueryLog, User
+from app.schemas import QueryIn, QueryLogOut, QueryOut
+from app.services.rag import answer_question
+from app.services.rate_limit import check_rate_limit
+
+router = APIRouter(prefix="/query", tags=["query"])
+
+
+@router.post("", response_model=QueryOut)
+def query(body: QueryIn, user: User = Depends(get_current_user),
+          db: Session = Depends(get_db)):
+    check_rate_limit(user.id)
+    return answer_question(db, user.id, body.question)
+
+
+@router.get("/history", response_model=list[QueryLogOut])
+def history(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    stmt = (select(QueryLog).where(QueryLog.user_id == user.id)
+            .order_by(QueryLog.id.desc()).limit(20))
+    return list(db.scalars(stmt))
+
+===== app/schemas.py =====
+from datetime import datetime
+
+from pydantic import BaseModel, EmailStr, Field
+
+
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+
+
+class DocumentOut(BaseModel):
+    id: int
+    filename: str
+    status: str
+    error_message: str | None = None
+    created_at: datetime
+
+
+class QueryIn(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+
+
+class SourceOut(BaseModel):
+    document_id: int
+    chunk_id: int
+    snippet: str
+
+
+class QueryOut(BaseModel):
+    answer: str
+    sources: list[SourceOut]
+    cached: bool
+
+
+class QueryLogOut(BaseModel):
+    id: int
+    question: str
+    answer: str
+    referenced_chunks: list
+    created_at: datetime
+
+===== app/services/__init__.py =====
+
+===== app/services/cache.py =====
+import hashlib
+import json
+
+import redis
+
+from app.config import settings
+
+_redis: redis.Redis | None = None
+
+
+def get_redis() -> redis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = redis.from_url(settings.redis_url, decode_responses=True)
+    return _redis
+
+
+def cache_key(user_id: int, question: str) -> str:
+    normalized = question.strip().lower()
+    return f"qa:cache:{user_id}:" + hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def get_cached_answer(user_id: int, question: str) -> dict | None:
+    raw = get_redis().get(cache_key(user_id, question))
+    return json.loads(raw) if raw else None
+
+
+def set_cached_answer(user_id: int, question: str, payload: dict) -> None:
+    get_redis().set(
+        cache_key(user_id, question),
+        json.dumps(payload, ensure_ascii=False),
+        ex=settings.cache_ttl_seconds,
+    )
+
+===== app/services/chunking.py =====
+def split_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
+    if not text:
+        return []
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+    step = chunk_size - overlap
+    chunks = []
+    for start in range(0, len(text), step):
+        chunks.append(text[start : start + chunk_size])
+        if start + chunk_size >= len(text):
+            break
+    return chunks
+
+===== app/services/embedding.py =====
+from sentence_transformers import SentenceTransformer
+
+from app.config import settings
+
+_model: SentenceTransformer | None = None
+
+# bge 系列：检索 query 侧加指令前缀，文档侧不加
+_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
+
+def _get_model() -> SentenceTransformer:
+    global _model
+    if _model is None:
+        _model = SentenceTransformer(settings.embedding_model)
+    return _model
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+    return _get_model().encode(texts, normalize_embeddings=True).tolist()
+
+
+def embed_query(text: str) -> list[float]:
+    return embed_texts([_QUERY_INSTRUCTION + text])[0]
+
+===== app/services/extraction.py =====
+import io
+
+from pypdf import PdfReader
+
+ALLOWED_EXTENSIONS = {".txt", ".pdf"}
+
+
+def extract_text(filename: str, data: bytes) -> str:
+    lower = filename.lower()
+    if lower.endswith(".txt"):
+        return data.decode("utf-8", errors="ignore")
+    if lower.endswith(".pdf"):
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    raise ValueError(f"Unsupported file type: {filename}")
+
+===== app/services/rag.py =====
+import logging
+
+import anthropic
+from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.models import Chunk, Document, QueryLog
+from app.services.cache import get_cached_answer, set_cached_answer
+from app.services.embedding import embed_query
+
+logger = logging.getLogger(__name__)
+
+_client = anthropic.Anthropic(api_key=settings.anthropic_api_key or None)
+
+SYSTEM_PROMPT = (
+    "你是一个知识库问答助手。只能基于用户提供的资料片段回答问题，"
+    "并在句末用 [编号] 标注引用来源。若资料片段不足以回答，"
+    "必须明确回答：资料中没有找到相关内容。不允许编造。"
+)
+
+NO_RESULT_ANSWER = "知识库中没有找到相关内容，请先上传相关文档或换个问法。"
+
+
+def retrieve_chunks(db: Session, user_id: int, question: str, top_k: int | None = None) -> list[Chunk]:
+    qvec = embed_query(question)
+    stmt = (
+        select(Chunk)
+        .join(Document, Chunk.document_id == Document.id)
+        .where(Document.user_id == user_id)
+        .order_by(Chunk.embedding.cosine_distance(qvec))
+        .limit(top_k or settings.top_k)
+    )
+    return list(db.scalars(stmt))
+
+
+def generate_answer(question: str, chunks: list[Chunk]) -> str:
+    if not chunks:
+        return NO_RESULT_ANSWER
+    context = "\n\n".join(f"[{i + 1}] {c.content}" for i, c in enumerate(chunks))
+    try:
+        resp = _client.messages.create(
+            model=settings.claude_model,
+            max_tokens=1024,
+            output_config={"effort": "low"},
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"资料片段：\n{context}\n\n问题：{question}",
+            }],
+        )
+        return next((b.text for b in resp.content if b.type == "text"), "")
+    except anthropic.RateLimitError:
+        logger.warning("claude rate limited")
+        raise HTTPException(503, "AI 服务繁忙，请稍后再试")
+    except anthropic.APIStatusError as e:
+        logger.error("claude api error status=%s", e.status_code)
+        raise HTTPException(502, "AI 服务暂时不可用")
+    except anthropic.APIConnectionError:
+        logger.error("claude connection error")
+        raise HTTPException(502, "AI 服务网络异常")
+
+
+def answer_question(db: Session, user_id: int, question: str) -> dict:
+    cached = get_cached_answer(user_id, question)
+    if cached is not None:
+        return {**cached, "cached": True}
+    chunks = retrieve_chunks(db, user_id, question)
+    answer = generate_answer(question, chunks)
+    sources = [
+        {"document_id": c.document_id, "chunk_id": c.id, "snippet": c.content[:100]}
+        for c in chunks
+    ]
+    db.add(QueryLog(user_id=user_id, question=question, answer=answer,
+                    referenced_chunks=sources))
+    db.flush()
+    payload = {"answer": answer, "sources": sources}
+    set_cached_answer(user_id, question, payload)
+    return {**payload, "cached": False}
+
+===== app/services/rate_limit.py =====
+import time
+
+from fastapi import HTTPException
+
+from app.config import settings
+from app.services.cache import get_redis
+
+
+def check_rate_limit(user_id: int) -> None:
+    window = int(time.time()) // 60
+    key = f"rl:{user_id}:{window}"
+    r = get_redis()
+    count = r.incr(key)
+    if count == 1:
+        r.expire(key, 60)
+    if count > settings.rate_limit_per_minute:
+        raise HTTPException(429, "Rate limit exceeded, try again later")
+
+===== app/tasks.py =====
+import logging
+
+from app.database import SessionLocal
+from app.models import Chunk, Document
+from app.services.chunking import split_text
+from app.services.embedding import embed_texts
+
+logger = logging.getLogger(__name__)
+
+
+def process_document(document_id: int, text: str, filename: str) -> None:
+    db = SessionLocal()
+    doc = db.get(Document, document_id)
+    if doc is None:
+        db.close()
+        return
+    try:
+        if not text.strip():
+            raise ValueError("empty document")
+        pieces = split_text(text)
+        vectors = embed_texts(pieces)
+        for i, (content, vec) in enumerate(zip(pieces, vectors)):
+            db.add(Chunk(document_id=document_id, content=content,
+                         embedding=vec, chunk_index=i))
+        doc.status = "completed"
+        db.commit()
+        logger.info("document processed",
+                    extra={"document_id": document_id, "chunks": len(pieces)})
+    except Exception as e:
+        db.rollback()
+        doc = db.get(Document, document_id)
+        if doc is not None:
+            doc.status = "failed"
+            doc.error_message = str(e)[:1000]
+            db.commit()
+        logger.exception("document processing failed")
+        raise
+    finally:
+        db.close()
+
+===== tests/__init__.py =====
+
+===== tests/conftest.py =====
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
+
+from app.database import engine, get_db, init_db
+from app.main import app
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _create_tables():
+    init_db()
+
+
+@pytest.fixture()
+def db():
+    connection = engine.connect()
+    transaction = connection.begin()
+    Session = sessionmaker(bind=connection)
+    session = Session()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture()
+def client(db):
+    app.dependency_overrides[get_db] = lambda: db
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def auth_headers(client):
+    client.post("/auth/register", json={"email": "me@t.com", "password": "secret1"})
+    token = client.post(
+        "/auth/login", json={"email": "me@t.com", "password": "secret1"}
+    ).json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+===== tests/test_auth.py =====
+def test_register_and_login(client):
+    r = client.post("/auth/register", json={"email": "u1@t.com", "password": "secret1"})
+    assert r.status_code == 201
+    r2 = client.post("/auth/register", json={"email": "u1@t.com", "password": "secret1"})
+    assert r2.status_code == 409
+    r3 = client.post("/auth/login", json={"email": "u1@t.com", "password": "secret1"})
+    assert r3.status_code == 200
+    assert r3.json()["access_token"]
+    r4 = client.post("/auth/login", json={"email": "u1@t.com", "password": "wrong!"})
+    assert r4.status_code == 401
+
+===== tests/test_cache.py =====
+import uuid
+
+from app.services.cache import cache_key, get_cached_answer, set_cached_answer
+
+
+def test_cache_key_normalized():
+    assert cache_key(1, " 什么是JWT ") == cache_key(1, "什么是jwt")
+
+
+def test_cache_roundtrip():
+    q = f"roundtrip-{uuid.uuid4()}"
+    assert get_cached_answer(1, q) is None
+    set_cached_answer(1, q, {"answer": "42", "sources": []})
+    assert get_cached_answer(1, q)["answer"] == "42"
+
+
+def test_cache_key_isolated_by_user():
+    assert cache_key(1, "q") != cache_key(2, "q")
+
+===== tests/test_chunking.py =====
+import pytest
+
+from app.services.chunking import split_text
+
+
+def test_empty_text():
+    assert split_text("") == []
+
+
+def test_overlap_not_smaller_than_chunk_size_raises():
+    with pytest.raises(ValueError):
+        split_text("abc", chunk_size=100, overlap=100)
+    with pytest.raises(ValueError):
+        split_text("abc", chunk_size=100, overlap=150)
+
+
+def test_short_text_single_chunk():
+    assert split_text("你好世界", chunk_size=500, overlap=100) == ["你好世界"]
+
+
+def test_overlap_window():
+    text = "a" * 1000
+    chunks = split_text(text, chunk_size=500, overlap=100)
+    assert len(chunks) == 3          # 步长400: [0:500],[400:900],[800:1000]
+    assert chunks[0] == text[0:500]
+    assert chunks[1] == text[400:900]
+    assert chunks[2] == text[800:1000]
+
+
+def test_all_content_covered():
+    text = "".join(str(i % 10) for i in range(1234))
+    chunks = split_text(text, chunk_size=500, overlap=100)
+    reconstructed = chunks[0] + "".join(c[100:] for c in chunks[1:])
+    assert reconstructed == text
+
+===== tests/test_documents.py =====
+import io
+from unittest.mock import patch
+
+
+def _upload(client, auth_headers, name="t.txt", content=b"hello world " * 100):
+    return client.post(
+        "/documents",
+        headers=auth_headers,
+        files={"file": (name, io.BytesIO(content), "text/plain")},
+    )
+
+
+def test_upload_requires_auth(client):
+    r = client.post("/documents", files={"file": ("t.txt", io.BytesIO(b"x"), "text/plain")})
+    assert r.status_code == 401
+
+
+@patch("app.routers.documents.get_queue")
+def test_upload_returns_processing(mock_q, client, auth_headers):
+    r = _upload(client, auth_headers)
+    assert r.status_code == 201
+    assert r.json()["status"] == "processing"
+    assert mock_q.return_value.enqueue.called
+
+
+@patch("app.routers.documents.get_queue")
+def test_reject_large_file(mock_q, client, auth_headers):
+    r = _upload(client, auth_headers, content=b"x" * (11 * 1024 * 1024))
+    assert r.status_code == 413
+
+
+@patch("app.routers.documents.get_queue")
+def test_reject_unsupported_type(mock_q, client, auth_headers):
+    r = _upload(client, auth_headers, name="t.docx")
+    assert r.status_code == 415
+
+
+@patch("app.routers.documents.get_queue")
+def test_list_and_delete(mock_q, client, auth_headers):
+    doc_id = _upload(client, auth_headers).json()["id"]
+    listing = client.get("/documents", headers=auth_headers).json()
+    assert any(d["id"] == doc_id for d in listing)
+    assert client.delete(f"/documents/{doc_id}", headers=auth_headers).status_code == 204
+    assert client.get(f"/documents/{doc_id}", headers=auth_headers).status_code == 404
+
+===== tests/test_embedding.py =====
+from app.services.embedding import embed_query, embed_texts
+
+
+def test_embed_texts_dimension():
+    vecs = embed_texts(["缓存是什么", "限流算法"])
+    assert len(vecs) == 2
+    assert len(vecs[0]) == 512
+
+
+def test_embed_empty_list():
+    assert embed_texts([]) == []
+
+
+def test_embed_query_dimension():
+    assert len(embed_query("什么是JWT")) == 512
+
+===== tests/test_health.py =====
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["postgres"] is True
+    assert body["redis"] is True
+    assert body["status"] == "ok"
+
+===== tests/test_models.py =====
+from app.models import User
+
+
+def test_create_user(db):
+    user = User(email="a@b.com", password_hash="x")
+    db.add(user)
+    db.flush()
+    assert user.id is not None
+    assert user.created_at is not None
+
+===== tests/test_query_api.py =====
+from unittest.mock import patch
+
+
+@patch("app.routers.query.answer_question")
+def test_query_endpoint(mock_answer, client, auth_headers):
+    mock_answer.return_value = {"answer": "42", "sources": [], "cached": False}
+    r = client.post("/query", headers=auth_headers, json={"question": "生命的意义?"})
+    assert r.status_code == 200
+    assert r.json()["answer"] == "42"
+
+
+def test_query_requires_auth(client):
+    assert client.post("/query", json={"question": "x"}).status_code == 401
+
+
+@patch("app.routers.query.answer_question")
+def test_history_empty(mock_answer, client, auth_headers):
+    r = client.get("/query/history", headers=auth_headers)
+    assert r.status_code == 200
+    assert r.json() == []
+
+===== tests/test_rag.py =====
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi import HTTPException
+
+from app.models import Chunk, Document, User
+from app.services import rag
+from app.services.rag import retrieve_chunks
+
+
+def _fake_chunk(i=1):
+    return SimpleNamespace(id=i, document_id=1, content=f"片段{i}内容")
+
+
+def _fake_response(text="答案"):
+    return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+
+
+@patch("app.services.rag._client")
+def test_generate_answer_calls_claude(mock_client):
+    mock_client.messages.create.return_value = _fake_response("JWT 是……[1]")
+    out = rag.generate_answer("什么是JWT", [_fake_chunk()])
+    assert "JWT" in out
+    kwargs = mock_client.messages.create.call_args.kwargs
+    assert kwargs["model"] == "claude-sonnet-5"
+
+
+def test_generate_answer_empty_chunks_skips_claude():
+    out = rag.generate_answer("无关问题", [])
+    assert "没有找到相关内容" in out
+
+
+@patch("app.services.rag._client")
+def test_generate_answer_degrades_on_rate_limit(mock_client):
+    import anthropic
+
+    mock_client.messages.create.side_effect = anthropic.RateLimitError(
+        message="rate limited",
+        response=MagicMock(status_code=429, headers={}),
+        body=None,
+    )
+    with pytest.raises(HTTPException) as exc:
+        rag.generate_answer("q", [_fake_chunk()])
+    assert exc.value.status_code == 503
+
+
+@patch("app.services.rag.embed_query", return_value=[0.0] * 512)
+def test_retrieve_chunks_isolated_by_user(mock_embed, db):
+    # Create two users
+    user_a = User(email="user_a@test.com", password_hash="x")
+    user_b = User(email="user_b@test.com", password_hash="x")
+    db.add_all([user_a, user_b])
+    db.flush()
+
+    # Each user has one document
+    doc_a = Document(user_id=user_a.id, filename="doc_a.txt", status="done")
+    doc_b = Document(user_id=user_b.id, filename="doc_b.txt", status="done")
+    db.add_all([doc_a, doc_b])
+    db.flush()
+
+    # Each document has one chunk
+    chunk_a = Chunk(document_id=doc_a.id, content="chunk from A", embedding=[0.0] * 512, chunk_index=0)
+    chunk_b = Chunk(document_id=doc_b.id, content="chunk from B", embedding=[0.1] * 512, chunk_index=0)
+    db.add_all([chunk_a, chunk_b])
+    db.flush()
+
+    results = retrieve_chunks(db, user_a.id, "test query")
+
+    assert len(results) >= 1
+    for chunk in results:
+        assert chunk.document_id == doc_a.id, (
+            f"Cross-user data leak: chunk {chunk.id} belongs to doc {chunk.document_id}, "
+            f"expected only doc {doc_a.id}"
+        )
+
+===== tests/test_rate_limit.py =====
+import random
+
+import pytest
+from fastapi import HTTPException
+
+from app.config import settings
+from app.services.rate_limit import check_rate_limit
+
+
+def test_rate_limit_blocks_after_threshold():
+    user_id = random.randint(10**8, 10**9)  # 随机 id 防跨测试污染
+    for _ in range(settings.rate_limit_per_minute):
+        check_rate_limit(user_id)
+    with pytest.raises(HTTPException) as exc:
+        check_rate_limit(user_id)
+    assert exc.value.status_code == 429
+
+===== tests/test_tasks.py =====
+from unittest.mock import patch
+
+from app.models import Chunk, Document, User
+from app.tasks import process_document
+
+
+def _make_doc(db, email="w@t.com", filename="a.txt"):
+    user = User(email=email, password_hash="x")
+    db.add(user)
+    db.flush()
+    doc = Document(user_id=user.id, filename=filename)
+    db.add(doc)
+    db.flush()
+    return doc
+
+
+def _bind_session(db):
+    # 让 task 复用测试事务中的 session；commit 降级为 flush 以便 fixture 回滚
+    original_rollback = db.rollback
+    db.commit = db.flush
+    db.close = lambda: None
+    # Suppress rollback errors in test context (transaction already managed by fixture)
+    db.rollback = lambda: None
+    return patch("app.tasks.SessionLocal", return_value=db)
+
+
+@patch("app.tasks.embed_texts", side_effect=lambda ts: [[0.0] * 512 for _ in ts])
+def test_process_document_completes(mock_emb, db):
+    doc = _make_doc(db)
+    with _bind_session(db):
+        process_document(doc.id, "测试内容。" * 200, "a.txt")
+    assert doc.status == "completed"
+    assert db.query(Chunk).filter_by(document_id=doc.id).count() > 0
+
+
+@patch("app.tasks.embed_texts", side_effect=lambda ts: [[0.0] * 512 for _ in ts])
+def test_process_document_empty_text_fails(mock_emb, db):
+    doc = _make_doc(db, email="w2@t.com", filename="bad.pdf")
+    with _bind_session(db):
+        try:
+            process_document(doc.id, "", "bad.pdf")
+        except ValueError:
+            pass
+    assert doc.status == "failed"
+    assert doc.error_message
+
+===== requirements.txt =====
+fastapi==0.116.*
+uvicorn[standard]==0.35.*
+email-validator==2.*
+sqlalchemy==2.0.*
+psycopg2-binary==2.9.*
+pgvector==0.4.*
+redis==6.*
+rq==2.*
+anthropic>=0.60
+sentence-transformers==5.*
+pyjwt==2.*
+passlib[bcrypt]==1.7.*
+bcrypt==4.0.1
+pypdf==5.*
+pydantic-settings==2.*
+python-multipart==0.0.*
+pytest==8.*
+httpx==0.28.*
+
+===== Dockerfile =====
+FROM python:3.11-slim
+WORKDIR /srv
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app/ app/
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+===== .dockerignore =====
+.venv
+.idea
+docs
+tests
+__pycache__
+*.pyc
+.env
+
+===== docker-compose.yml =====
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: kqa
+      POSTGRES_PASSWORD: kqa
+      POSTGRES_DB: kqa
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kqa"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://kqa:kqa@postgres:5432/kqa
+      REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+    volumes: [hf_cache:/root/.cache/huggingface]
+  worker:
+    build: .
+    command: rq worker documents --url redis://redis:6379/0
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://kqa:kqa@postgres:5432/kqa
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+    volumes: [hf_cache:/root/.cache/huggingface]
+volumes:
+  pgdata:
+  hf_cache:
+
+===== .env.example =====
+ANTHROPIC_API_KEY=sk-ant-xxx
+DATABASE_URL=postgresql://kqa:kqa@localhost:5432/kqa
+REDIS_URL=redis://localhost:6379/0
+JWT_SECRET=please-generate-a-random-secret
+
+===== Deferred minor findings from task reviews (triage these) =====
+  Minor deferred: bcrypt==4.0.1 exact pin style inconsistency (plan-mandated)
+Task 3: complete (review approved; controller added missing ValueError-branch test per reviewer Important finding — 5/5 pass)
+  Note: passlib 'crypt' DeprecationWarning appears in test output (third-party, py3.13-forward; harmless on 3.11) — deferred
+Task 4: complete (review clean; bge model downloaded to HF cache, 3/3 + full suite 10/10)
+Task 5: complete (review approved after fix loop: tasks.py error path restored to brief canonical — implementer had added swallowing except guards; test harness _bind_session now no-ops rollback, reviewer judged sound)
+--
+  Minor deferred: whole file read into memory before 413 check (plan-mandated); suffix logic duplicated between router and extraction; dead original_rollback var + superfluous embed_texts patch in test_tasks.py
+Task 9: complete (review approved; 4 containers up, health ok; Step 5 real-Claude smoke PASSED: register→upload→query with [1] citation 4.3s→cached repeat 0.01s; claude-sonnet-5 real-API validated)
+  USER-APPROVED FIX during smoke: per-user isolation — retrieve_chunks joins Document filtering user_id; cache key now qa:cache:{user_id}:<hash> (smoke had proven cross-user chunk leak: doc 1 test data in demo user's sources; post-fix smoke shows only own doc 56). Suite 29/29.
+--
+  Minor deferred: middleware logs skip on unhandled handler exceptions (FastAPI limitation); get_redis broken-singleton retry; method concatenated into path log key (brief-ambiguous)
+Task 7: complete (review approved; ⚠️ resolved by controller: QueryLog persistence relies on get_db commit-on-success ✓; claude-sonnet-5 validity confirmed last session from official docs, real-API check due at Task 9 smoke)
+  Minor deferred: SourceOut.snippet no schema-level max_length; dead answer_question patch on test_history_empty
+Task 6: complete (review clean after controller intervention: implementer hit stale redis container lacking host port mapping — created during Task 1's port conflict — and invented a docker-exec bridge hack; controller force-recreated container (root cause), deleted tests/redis_docker_bridge.py, reverted get_redis()/conftest.py to canonical; suite 20/20 on real Redis)

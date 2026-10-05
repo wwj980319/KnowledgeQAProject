@@ -1,0 +1,113 @@
+# Review package: Task 8 (no git — full contents of created/modified files)
+
+===== app/logging_conf.py =====
+import json
+import logging
+import sys
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for k in ("document_id", "chunks", "user_id", "path", "status", "duration_ms"):
+            if hasattr(record, k):
+                payload[k] = getattr(record, k)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def setup_logging() -> None:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+===== app/routers/health.py =====
+from fastapi import APIRouter, Depends
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.services.cache import get_redis
+
+router = APIRouter(tags=["ops"])
+
+
+@router.get("/health")
+def health(db: Session = Depends(get_db)):
+    pg_ok = redis_ok = False
+    try:
+        db.execute(text("SELECT 1"))
+        pg_ok = True
+    except Exception:
+        pass
+    try:
+        redis_ok = bool(get_redis().ping())
+    except Exception:
+        pass
+    return {
+        "status": "ok" if (pg_ok and redis_ok) else "degraded",
+        "postgres": pg_ok,
+        "redis": redis_ok,
+    }
+
+===== app/main.py =====
+import logging
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+
+from app.database import init_db
+from app.logging_conf import setup_logging
+from app.routers import auth as auth_router
+from app.routers import documents as documents_router
+from app.routers import health as health_router
+from app.routers import query as query_router
+
+logger = logging.getLogger("request")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+    init_db()
+    yield
+
+
+app = FastAPI(title="Knowledge QA Service", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    logger.info(
+        "request",
+        extra={
+            "path": f"{request.method} {request.url.path}",
+            "status": response.status_code,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 1),
+        },
+    )
+    return response
+
+
+app.include_router(auth_router.router)
+app.include_router(documents_router.router)
+app.include_router(query_router.router)
+app.include_router(health_router.router)
+
+===== tests/test_health.py =====
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["postgres"] is True
+    assert body["redis"] is True
+    assert body["status"] == "ok"
